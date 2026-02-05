@@ -128,7 +128,30 @@ use utf16_iter::Utf16CharsWithTrieEx;
 #[cfg(feature = "utf8_iter")]
 use utf8_iter::Utf8CharsEx;
 #[cfg(feature = "utf8_iter")]
-use utf8_iter::Utf8CharsWithTrieDefaultForAsciiEx;
+use utf8_iter::Utf8CharsWithTrieEx;
+#[cfg(feature = "utf8_iter")]
+use utf8_iter::Utf8CharsWithTrie;
+#[cfg(feature = "utf8_iter")]
+use icu_collections::codepointtrie::TrieValue;
+
+#[cfg(feature = "utf8_iter")]
+trait CharsWithTrieForStr {
+    fn chars_with_trie<'slice, 'trie, T, V>(&'slice self, trie: &'trie T) -> Utf8CharsWithTrie<'slice, 'trie, T, V>
+    where
+        T: AbstractCodePointTrie<'trie, V>,
+        V: TrieValue;
+}
+
+#[cfg(feature = "utf8_iter")]
+impl CharsWithTrieForStr for str {
+    fn chars_with_trie<'slice, 'trie, T, V>(&'slice self, trie: &'trie T) -> Utf8CharsWithTrie<'slice, 'trie, T, V>
+    where
+        T: AbstractCodePointTrie<'trie, V>,
+        V: TrieValue
+    {
+        self.as_bytes().chars_with_trie(trie)
+    }
+}
 use zerovec::{zeroslice, ZeroSlice};
 
 // The optimizations in the area where `likely` is used
@@ -1716,6 +1739,7 @@ macro_rules! composing_normalize_to {
      $always_valid_utf:literal,
      $as_slice:ident,
      $fast:block,
+     $hangul_fast:block,
      $text:ident,
      $sink:ident,
      $composition:ident,
@@ -1724,6 +1748,8 @@ macro_rules! composing_normalize_to {
      $len_utf:ident,
      $self:ident,
      $chars_with_trie:ident,
+     $starter:ident,
+     $starter_is_lv:ident,
     ) => {
         $(#[$meta])*
         pub fn $normalize_to<W: $write + ?Sized>(
@@ -1763,7 +1789,7 @@ macro_rules! composing_normalize_to {
                     }
                 }
                 // Fast track above, full algorithm below
-                let mut starter = $composition
+                let mut $starter = $composition
                     .decomposition
                     .decomposing_next($undecomposed_starter);
                 'bufferloop: loop {
@@ -1785,8 +1811,8 @@ macro_rules! composing_normalize_to {
                         // In NFKC, enclosed Hangul get recomposed here.
                         // Furthermore, in NFC if input has lv followed by t, lv gets
                         // decomposed above and recomposed here.
-                        if let Some(composed) = $composition.compose(starter, character) {
-                            starter = composed;
+                        if let Some(composed) = $composition.compose($starter, character) {
+                            $starter = composed;
                             $composition.decomposition.buffer_pos += 1;
                             continue;
                         }
@@ -1796,8 +1822,8 @@ macro_rules! composing_normalize_to {
                             // Write the current `starter` we've been composing, make the unmatched
                             // starter in the buffer the new `starter` (we know it's been decomposed)
                             // and process the rest of the buffer with that as the starter.
-                            $sink.write_char(starter)?;
-                            starter = character;
+                            $sink.write_char($starter)?;
+                            $starter = character;
                             $composition.decomposition.buffer_pos += 1;
                             continue 'bufferloop;
                         } else {
@@ -1818,14 +1844,14 @@ macro_rules! composing_normalize_to {
                         {
                             if ccc == CCC_NOT_REORDERED {
                                 // Discontiguous match not allowed.
-                                $sink.write_char(starter)?;
+                                $sink.write_char($starter)?;
                                 for cc in $composition.decomposition.buffer.drain(..i) {
                                     $sink.write_char(cc.character())?;
                                 }
-                                starter = character;
+                                $starter = character;
                                 {
                                     let removed = $composition.decomposition.buffer.remove(0);
-                                    debug_assert_eq!(starter, removed.character());
+                                    debug_assert_eq!($starter, removed.character());
                                 }
                                 debug_assert_eq!($composition.decomposition.buffer_pos, 0);
                                 continue 'bufferloop;
@@ -1835,10 +1861,10 @@ macro_rules! composing_normalize_to {
                                 // `character` is a non-starter, so we could use a variant of
                                 // `compose` that omits all the Hangul cases.
                                 if let Some(composed) =
-                                    $composition.compose(starter, character)
+                                    $composition.compose($starter, character)
                                 {
                                     $composition.decomposition.buffer.remove(i);
-                                    starter = composed;
+                                    $starter = composed;
                                     continue;
                                 }
                             }
@@ -1850,7 +1876,7 @@ macro_rules! composing_normalize_to {
                     debug_assert_eq!($composition.decomposition.buffer_pos, 0);
 
                     if !$composition.decomposition.buffer.is_empty() {
-                        $sink.write_char(starter)?;
+                        $sink.write_char($starter)?;
                         for cc in $composition.decomposition.buffer.drain(..) {
                             $sink.write_char(cc.character())?;
                         }
@@ -1861,7 +1887,7 @@ macro_rules! composing_normalize_to {
                     // makes this code much simpler than trying to have a special
                     // case that advances the underlying iterator in the branch that
                     // now says `continue;` below.
-                    let mut starter_is_lv = false;
+                    let mut $starter_is_lv = false;
                     loop {
                         // Now we need to check if composition with an upcoming starter is possible.
                         if $composition.decomposition.pending.is_some() {
@@ -1876,33 +1902,30 @@ macro_rules! composing_normalize_to {
                             if !pending.can_combine_backwards()
                             {
                                 // Won't combine backwards anyway.
-                                $sink.write_char(starter)?;
+                                $sink.write_char($starter)?;
                                 continue 'outer;
                             }
                             let pending_starter = $composition.decomposition.pending.take().unwrap();
                             let decomposed = $composition.decomposition.decomposing_next(pending_starter);
                             // Normal non-enclosed Hangul is composed here. The case where we have LV and T,
                             // but LV was not composed here previously is possible.
-                            if let Some((composed, is_lv)) = $composition.compose_starter(starter, decomposed, starter_is_lv) {
-                                starter = composed;
+                            if let Some((composed, is_lv)) = $composition.compose_starter($starter, decomposed, $starter_is_lv) {
+                                $starter = composed;
                                 if is_lv && $composition.decomposition.buffer.is_empty() {
-                                    starter_is_lv = true;
-                                    // TODO: Put a Hangul fast-path that deals with conjoining jamo and ASCII
-                                    // in a manner specialized for the UTF (i.e. not doing surrogate checks,
-                                    // since surrogates are neither conjoining jamo nor ASCII) here.
-                                    // https://github.com/unicode-org/icu4x/issues/7516
+                                    $starter_is_lv = true;
+                                    $hangul_fast
                                     continue;
                                 }
                             } else {
-                                $sink.write_char(starter)?;
-                                starter = decomposed;
+                                $sink.write_char($starter)?;
+                                $starter = decomposed;
                             }
                             continue 'bufferloop;
                         }
                         break;
                     }
                     // End of input
-                    $sink.write_char(starter)?;
+                    $sink.write_char($starter)?;
                     return Ok(());
                 } // 'bufferloop
             }
@@ -2702,7 +2725,7 @@ impl<'data> DecomposingNormalizerBorrowed<'data> {
         pending_slice,
         'outer,
         self,
-        chars_with_trie_default_for_ascii,
+        chars_with_trie,
     );
 
     decomposing_normalize_to!(
@@ -3314,7 +3337,7 @@ impl<'data> ComposingNormalizerBorrowed<'data> {
         &str,
         {},
         true,
-        as_str,
+        as_slice,
         {
             let composition_passthrough_byte_bound = if self.decomposing_normalizer.composition_passthrough_bound == 0x300 {
                 0xCCu8
@@ -3324,7 +3347,7 @@ impl<'data> ComposingNormalizerBorrowed<'data> {
                 self.decomposing_normalizer.composition_passthrough_bound.min(0x80) as u8
             };
             // Attributes have to be on blocks, so hoisting all the way here.
-            let mut code_unit_iter = composition.decomposition.delegate.as_str().as_bytes().iter();
+            let mut code_unit_iter = composition.decomposition.delegate.as_slice().iter();
             'fast: loop {
                 if let Some(b) = code_unit_iter.next() {
                     let upcoming_byte = *b;
@@ -3397,26 +3420,40 @@ impl<'data> ComposingNormalizerBorrowed<'data> {
                         continue 'fast;
                     }
                     // SAFETY: We've advanced `code_unit_iter` to a UTF-8 boundary.
-                    composition.decomposition.delegate = unsafe { core::str::from_utf8_unchecked(code_unit_iter.as_slice())}.chars_with_trie_default_for_ascii(composition.decomposition.delegate.trie());
+                    composition.decomposition.delegate = unsafe { core::str::from_utf8_unchecked(code_unit_iter.as_slice())}.chars_with_trie(composition.decomposition.delegate.trie());
                     let upcoming_with_trie_value = CharacterAndTrieValue::new(upcoming, trie_val);
                     // We need to fall off the fast path.
                     composition.decomposition.pending = Some(upcoming_with_trie_value);
 
                     // slicing and unwrap OK, because we've just evidently read enough previously.
-                    let mut consumed_so_far = pending_slice[..pending_slice.len() - composition.decomposition.delegate.as_str().len() - upcoming.len_utf8()].chars_with_trie_default_for_ascii(composition.decomposition.delegate.trie());
+                    let mut consumed_so_far = pending_slice[..pending_slice.len() - composition.decomposition.delegate.as_slice().len() - upcoming.len_utf8()].chars_with_trie(composition.decomposition.delegate.trie());
                     // Whether we could do something better than `next_back()` below is
                     // https://github.com/unicode-org/icu4x/issues/7525
                     // `unwrap` OK, because we've previously manage to read the previous character
                     #[expect(clippy::unwrap_used)]
                     let (undecomposed, undecomposed_trie_val) = consumed_so_far.next_back().unwrap();
                     undecomposed_starter = CharacterAndTrieValue::new(undecomposed, undecomposed_trie_val);
-                    let consumed_so_far_slice = consumed_so_far.as_str();
-                    sink.write_str(consumed_so_far_slice)?;
+                    let consumed_so_far_slice = consumed_so_far.as_slice();
+                    sink.write_str(unsafe { core::str::from_utf8_unchecked(consumed_so_far_slice) })?;
                     break 'fast;
                 }
                 // End of stream
                 sink.write_str(pending_slice)?;
                 return Ok(());
+            }
+        },
+        {
+            if let Some(upcoming_with_trie_value) = composition.decomposition.pending.take() {
+                let upcoming = upcoming_with_trie_value.character;
+                if upcoming >= '\u{11A8}' && upcoming <= '\u{11C2}' {
+                    starter = unsafe { char::from_u32_unchecked(starter as u32 + (upcoming as u32 - 0x11A7)) };
+                    starter_is_lv = false;
+                } else if upcoming.is_ascii() {
+                    starter_is_lv = false;
+                    composition.decomposition.pending = Some(upcoming_with_trie_value);
+                } else {
+                    composition.decomposition.pending = Some(upcoming_with_trie_value);
+                }
             }
         },
         text,
@@ -3426,7 +3463,9 @@ impl<'data> ComposingNormalizerBorrowed<'data> {
         pending_slice,
         len_utf8,
         self,
-        chars_with_trie_default_for_ascii,
+        chars_with_trie,
+        starter,
+        starter_is_lv,
     );
 
     composing_normalize_to!(
@@ -3481,7 +3520,7 @@ impl<'data> ComposingNormalizerBorrowed<'data> {
                     // slicing and unwrap OK, because we've just evidently read enough previously.
                     // `unwrap` OK, because we've previously manage to read the previous character
                     #[expect(clippy::indexing_slicing)]
-                    let mut consumed_so_far = pending_slice[..pending_slice.len() - composition.decomposition.delegate.as_slice().len() - upcoming.len_utf8()].chars_with_trie_default_for_ascii(composition.decomposition.delegate.trie());
+                    let mut consumed_so_far = pending_slice[..pending_slice.len() - composition.decomposition.delegate.as_slice().len() - upcoming.len_utf8()].chars_with_trie(composition.decomposition.delegate.trie());
                     #[expect(clippy::unwrap_used)]
                     {
                         // Whether we could do something better than `next_back()` below is
@@ -3498,6 +3537,7 @@ impl<'data> ComposingNormalizerBorrowed<'data> {
                 return Ok(());
             }
         },
+        {},
         text,
         sink,
         composition,
@@ -3505,7 +3545,9 @@ impl<'data> ComposingNormalizerBorrowed<'data> {
         pending_slice,
         len_utf8,
         self,
-        chars_with_trie_default_for_ascii,
+        chars_with_trie,
+        starter,
+        starter_is_lv,
     );
 
     composing_normalize_to!(
@@ -3707,6 +3749,25 @@ impl<'data> ComposingNormalizerBorrowed<'data> {
                 break 'fastwrap;
             }
         },
+        {
+            let slice = composition.decomposition.delegate.as_slice();
+            if let Some(&first) = slice.first() {
+                let first_u32 = u32::from(first);
+                if (0x11A7..=0x11C2).contains(&first_u32) {
+                    composition.decomposition.delegate.next();
+                    let t_index = first_u32 - 0x11A7;
+                    starter = unsafe { char::from_u32_unchecked(u32::from(starter) + t_index) };
+                    starter_is_lv = false;
+                    continue;
+                } else if first_u32 < 0x80 {
+                    sink.write_char(starter)?;
+                    composition.decomposition.delegate.next();
+                    starter = unsafe { char::from_u32_unchecked(first_u32) };
+                    starter_is_lv = false;
+                    continue;
+                }
+            }
+        },
         text,
         sink,
         composition,
@@ -3715,6 +3776,8 @@ impl<'data> ComposingNormalizerBorrowed<'data> {
         len_utf16,
         self,
         chars_with_trie,
+        starter,
+        starter_is_lv,
     );
 }
 
